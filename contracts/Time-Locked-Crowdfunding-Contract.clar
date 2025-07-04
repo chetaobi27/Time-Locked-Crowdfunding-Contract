@@ -93,3 +93,144 @@
 
 (define-read-only (get-milestone (milestone-id uint))
     (ok (map-get? milestones milestone-id)))
+
+(define-constant ERR-EXTENSION-NOT-ALLOWED (err u200))
+(define-constant ERR-ALREADY-VOTED (err u201))
+(define-constant ERR-EXTENSION-ACTIVE (err u202))
+(define-constant ERR-INSUFFICIENT-PROGRESS (err u203))
+
+(define-data-var extension-proposal-active bool false)
+(define-data-var extension-proposal-deadline uint u0)
+(define-data-var extension-duration uint u0)
+(define-data-var extension-votes-for uint u0)
+(define-data-var extension-votes-against uint u0)
+(define-data-var extension-total-voting-power uint u0)
+
+(define-map extension-voters principal bool)
+
+(define-public (propose-extension (duration uint))
+    (let ((progress-percentage (/ (* (var-get total-raised) u100) (var-get campaign-goal))))
+        (begin
+            (asserts! (not (var-get extension-proposal-active)) ERR-EXTENSION-ACTIVE)
+            (asserts! (>= progress-percentage u75) ERR-INSUFFICIENT-PROGRESS)
+            (asserts! (< (- (var-get campaign-deadline) stacks-block-height) u144) ERR-EXTENSION-NOT-ALLOWED)
+            (var-set extension-proposal-active true)
+            (var-set extension-proposal-deadline (+ stacks-block-height u144))
+            (var-set extension-duration duration)
+            (var-set extension-votes-for u0)
+            (var-set extension-votes-against u0)
+            (var-set extension-total-voting-power (var-get total-raised))
+            (ok true))))
+
+(define-public (vote-extension (support bool))
+    (let ((contribution (unwrap! (map-get? contributions tx-sender) ERR-NO-CONTRIBUTION)))
+        (begin
+            (asserts! (var-get extension-proposal-active) ERR-EXTENSION-NOT-ALLOWED)
+            (asserts! (< stacks-block-height (var-get extension-proposal-deadline)) ERR-CAMPAIGN-ENDED)
+            (asserts! (is-none (map-get? extension-voters tx-sender)) ERR-ALREADY-VOTED)
+            (map-set extension-voters tx-sender true)
+            (if support
+                (var-set extension-votes-for (+ (var-get extension-votes-for) (get amount contribution)))
+                (var-set extension-votes-against (+ (var-get extension-votes-against) (get amount contribution))))
+            (ok true))))
+
+(define-public (execute-extension)
+    (let ((votes-for (var-get extension-votes-for))
+          (votes-against (var-get extension-votes-against))
+          (total-votes (+ votes-for votes-against))
+          (voting-power (var-get extension-total-voting-power)))
+        (begin
+            (asserts! (var-get extension-proposal-active) ERR-EXTENSION-NOT-ALLOWED)
+            (asserts! (>= stacks-block-height (var-get extension-proposal-deadline)) ERR-CAMPAIGN-NOT-ENDED)
+            (asserts! (>= total-votes (/ voting-power u2)) ERR-INSUFFICIENT-PROGRESS)
+            (asserts! (> votes-for votes-against) ERR-GOAL-NOT-MET)
+            (var-set campaign-deadline (+ (var-get campaign-deadline) (var-get extension-duration)))
+            (var-set extension-proposal-active false)
+            (ok true))))
+
+(define-read-only (get-extension-status)
+    (ok {
+        active: (var-get extension-proposal-active),
+        deadline: (var-get extension-proposal-deadline),
+        duration: (var-get extension-duration),
+        votes-for: (var-get extension-votes-for),
+        votes-against: (var-get extension-votes-against),
+        total-voting-power: (var-get extension-total-voting-power)
+    }))
+
+    (define-constant ERR-BATCH-SIZE-EXCEEDED (err u300))
+(define-constant ERR-REFUND-NOT-AVAILABLE (err u301))
+(define-constant ERR-BATCH-EMPTY (err u302))
+
+(define-data-var max-batch-size uint u50)
+(define-data-var auto-refund-enabled bool false)
+(define-data-var refund-processing-active bool false)
+
+(define-map refund-queue principal uint)
+(define-data-var queue-length uint u0)
+
+(define-public (enable-auto-refund)
+    (begin
+        (asserts! (is-eq tx-sender (var-get campaign-owner)) ERR-UNAUTHORIZED)
+        (asserts! (>= stacks-block-height (var-get campaign-deadline)) ERR-CAMPAIGN-NOT-ENDED)
+        (asserts! (< (var-get total-raised) (var-get campaign-goal)) ERR-GOAL-NOT-MET)
+        (var-set auto-refund-enabled true)
+        (ok true)))
+
+(define-public (queue-for-refund)
+    (let ((contribution (unwrap! (map-get? contributions tx-sender) ERR-NO-CONTRIBUTION)))
+        (begin
+            (asserts! (var-get auto-refund-enabled) ERR-REFUND-NOT-AVAILABLE)
+            (asserts! (not (get claimed contribution)) ERR-ALREADY-CLAIMED)
+            (asserts! (is-none (map-get? refund-queue tx-sender)) ERR-ALREADY-CLAIMED)
+            (map-set refund-queue tx-sender (get amount contribution))
+            (var-set queue-length (+ (var-get queue-length) u1))
+            (ok true))))
+
+(define-public (process-batch-refunds (recipients (list 50 principal)))
+    (begin
+        (asserts! (var-get auto-refund-enabled) ERR-REFUND-NOT-AVAILABLE)
+        (asserts! (not (var-get refund-processing-active)) ERR-REFUND-NOT-AVAILABLE)
+        (asserts! (> (len recipients) u0) ERR-BATCH-EMPTY)
+        (asserts! (<= (len recipients) (var-get max-batch-size)) ERR-BATCH-SIZE-EXCEEDED)
+        (var-set refund-processing-active true)
+        (try! (fold process-single-refund recipients (ok true)))
+        (var-set refund-processing-active false)
+        (ok true)))
+
+(define-private (process-single-refund (recipient principal) (previous-result (response bool uint)))
+    (match previous-result
+        success (let ((refund-amount (default-to u0 (map-get? refund-queue recipient)))
+                     (contribution (default-to {amount: u0, claimed: false} (map-get? contributions recipient))))
+            (if (and (> refund-amount u0) (not (get claimed contribution)))
+                (begin
+                    (map-delete refund-queue recipient)
+                    (map-set contributions recipient (merge contribution {claimed: true}))
+                    (var-set queue-length (- (var-get queue-length) u1))
+                    (match (as-contract (stx-transfer? refund-amount tx-sender recipient))
+                        transfer-success (ok true)
+                        transfer-error (err transfer-error)))
+                (ok true)))
+        error (err error)))
+
+(define-public (emergency-refund-all)
+    (begin
+        (asserts! (is-eq tx-sender (var-get campaign-owner)) ERR-UNAUTHORIZED)
+        (asserts! (>= stacks-block-height (var-get campaign-deadline)) ERR-CAMPAIGN-NOT-ENDED)
+        (var-set auto-refund-enabled true)
+        (var-set is-active false)
+        (ok true)))
+
+(define-read-only (get-refund-status)
+    (ok {
+        auto-refund-enabled: (var-get auto-refund-enabled),
+        processing-active: (var-get refund-processing-active),
+        queue-length: (var-get queue-length),
+        max-batch-size: (var-get max-batch-size)
+    }))
+
+(define-read-only (get-user-refund-status (user principal))
+    (ok {
+        queued-amount: (default-to u0 (map-get? refund-queue user)),
+        in-queue: (is-some (map-get? refund-queue user))
+    }))
