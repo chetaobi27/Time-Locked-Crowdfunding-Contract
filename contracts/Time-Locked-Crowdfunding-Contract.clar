@@ -234,3 +234,70 @@
         queued-amount: (default-to u0 (map-get? refund-queue user)),
         in-queue: (is-some (map-get? refund-queue user))
     }))
+
+(define-constant ERR-REWARD-NOT-FOUND (err u400))
+(define-constant ERR-REWARD-CLAIMED (err u401))
+(define-constant ERR-INELIGIBLE-REWARD (err u402))
+(define-constant ERR-REWARD-EXISTS (err u403))
+
+(define-map reward-tiers 
+    uint 
+    {min-contribution: uint, reward-description: (string-ascii 100), max-claims: uint, claimed: uint})
+
+(define-map user-rewards 
+    {user: principal, tier-id: uint}
+    {claimed: bool, claim-timestamp: uint})
+
+(define-data-var next-tier-id uint u1)
+
+(define-public (create-reward-tier (min-contribution uint) (reward-description (string-ascii 100)) (max-claims uint))
+    (let ((tier-id (var-get next-tier-id)))
+        (begin
+            (asserts! (is-eq tx-sender (var-get campaign-owner)) ERR-UNAUTHORIZED)
+            (map-set reward-tiers tier-id {
+                min-contribution: min-contribution,
+                reward-description: reward-description,
+                max-claims: max-claims,
+                claimed: u0
+            })
+            (var-set next-tier-id (+ tier-id u1))
+            (ok tier-id))))
+
+(define-public (claim-reward (tier-id uint))
+    (let ((tier (unwrap! (map-get? reward-tiers tier-id) ERR-REWARD-NOT-FOUND))
+          (contribution (unwrap! (map-get? contributions tx-sender) ERR-NO-CONTRIBUTION))
+          (user-reward-key {user: tx-sender, tier-id: tier-id})
+          (existing-claim (map-get? user-rewards user-reward-key)))
+        (begin
+            (asserts! (>= stacks-block-height (var-get campaign-deadline)) ERR-CAMPAIGN-NOT-ENDED)
+            (asserts! (>= (var-get total-raised) (var-get campaign-goal)) ERR-GOAL-NOT-MET)
+            (asserts! (>= (get amount contribution) (get min-contribution tier)) ERR-INELIGIBLE-REWARD)
+            (asserts! (< (get claimed tier) (get max-claims tier)) ERR-REWARD-CLAIMED)
+            (asserts! (is-none existing-claim) ERR-REWARD-CLAIMED)
+            (map-set user-rewards user-reward-key {
+                claimed: true,
+                claim-timestamp: stacks-block-height
+            })
+            (map-set reward-tiers tier-id 
+                (merge tier {claimed: (+ (get claimed tier) u1)}))
+            (ok true))))
+
+(define-read-only (get-reward-tier (tier-id uint))
+    (ok (map-get? reward-tiers tier-id)))
+
+(define-read-only (get-user-reward-status (user principal) (tier-id uint))
+    (ok (map-get? user-rewards {user: user, tier-id: tier-id})))
+
+(define-read-only (get-eligible-rewards (user principal))
+    (let ((contribution (map-get? contributions user)))
+        (if (is-some contribution)
+            (let ((contribution-data (unwrap-panic contribution))
+                  (contribution-amount (get amount contribution-data)))
+                (ok {
+                    contribution-amount: contribution-amount,
+                    eligible-tiers: (filter check-tier-eligibility (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10))
+                }))
+            (ok {contribution-amount: u0, eligible-tiers: (list)}))))
+
+(define-private (check-tier-eligibility (tier-id uint))
+    (is-some (map-get? reward-tiers tier-id)))
