@@ -301,3 +301,103 @@
 
 (define-private (check-tier-eligibility (tier-id uint))
     (is-some (map-get? reward-tiers tier-id)))
+
+(define-constant ERR-MILESTONE-THRESHOLD-NOT-MET (err u500))
+(define-constant ERR-RELEASE-AMOUNT-INVALID (err u501))
+(define-constant ERR-PROGRESSIVE-RELEASE-NOT-ENABLED (err u502))
+(define-constant ERR-INSUFFICIENT_FUNDS (err u503))
+
+(define-data-var progressive-release-enabled bool false)
+(define-data-var total-progressive-released uint u0)
+(define-data-var progressive-release-percentage uint u20)
+
+(define-map progressive-thresholds
+    uint
+    {threshold-percentage: uint, release-percentage: uint, unlocked: bool})
+
+(define-data-var next-threshold-id uint u1)
+
+(define-public (enable-progressive-release)
+    (begin
+        (asserts! (is-eq tx-sender (var-get campaign-owner)) ERR-UNAUTHORIZED)
+        (asserts! (< stacks-block-height (var-get campaign-deadline)) ERR-CAMPAIGN-ENDED)
+        (var-set progressive-release-enabled true)
+        (ok true)))
+
+(define-public (create-progressive-threshold (threshold-percentage uint) (release-percentage uint))
+    (let ((threshold-id (var-get next-threshold-id)))
+        (begin
+            (asserts! (is-eq tx-sender (var-get campaign-owner)) ERR-UNAUTHORIZED)
+            (asserts! (<= threshold-percentage u100) ERR-INVALID-AMOUNT)
+            (asserts! (<= release-percentage u100) ERR-INVALID-AMOUNT)
+            (asserts! (> threshold-percentage u0) ERR-INVALID-AMOUNT)
+            (asserts! (> release-percentage u0) ERR-INVALID-AMOUNT)
+            (map-set progressive-thresholds threshold-id {
+                threshold-percentage: threshold-percentage,
+                release-percentage: release-percentage,
+                unlocked: false
+            })
+            (var-set next-threshold-id (+ threshold-id u1))
+            (ok threshold-id))))
+
+(define-public (unlock-progressive-funds (threshold-id uint))
+    (let ((threshold (unwrap! (map-get? progressive-thresholds threshold-id) ERR-MILESTONE-THRESHOLD-NOT-MET))
+          (current-progress (/ (* (var-get total-raised) u100) (var-get campaign-goal)))
+          (release-amount (/ (* (var-get total-raised) (get release-percentage threshold)) u100))
+          (contract-balance (stx-get-balance (as-contract tx-sender))))
+        (begin
+            (asserts! (var-get progressive-release-enabled) ERR-PROGRESSIVE-RELEASE-NOT-ENABLED)
+            (asserts! (>= current-progress (get threshold-percentage threshold)) ERR-MILESTONE-THRESHOLD-NOT-MET)
+            (asserts! (not (get unlocked threshold)) ERR-ALREADY-CLAIMED)
+            (asserts! (>= contract-balance release-amount) ERR-INSUFFICIENT_FUNDS)
+            (map-set progressive-thresholds threshold-id 
+                (merge threshold {unlocked: true}))
+            (var-set total-progressive-released 
+                (+ (var-get total-progressive-released) release-amount))
+            (try! (as-contract
+                (stx-transfer? 
+                    release-amount
+                    tx-sender
+                    (var-get campaign-owner))))
+            (ok release-amount))))
+
+(define-public (claim-remaining-funds)
+    (let ((remaining-amount (- (var-get total-raised) (var-get total-progressive-released)))
+          (contract-balance (stx-get-balance (as-contract tx-sender))))
+        (begin
+            (asserts! (is-eq tx-sender (var-get campaign-owner)) ERR-UNAUTHORIZED)
+            (asserts! (>= stacks-block-height (var-get campaign-deadline)) ERR-CAMPAIGN-NOT-ENDED)
+            (asserts! (>= (var-get total-raised) (var-get campaign-goal)) ERR-GOAL-NOT-MET)
+            (asserts! (> remaining-amount u0) ERR-INVALID-AMOUNT)
+            (asserts! (>= contract-balance remaining-amount) ERR-INSUFFICIENT_FUNDS)
+            (var-set total-progressive-released (var-get total-raised))
+            (try! (as-contract
+                (stx-transfer? 
+                    remaining-amount
+                    tx-sender
+                    (var-get campaign-owner))))
+            (ok remaining-amount))))
+
+(define-read-only (get-progressive-release-status)
+    (ok {
+        enabled: (var-get progressive-release-enabled),
+        total-released: (var-get total-progressive-released),
+        remaining-funds: (- (var-get total-raised) (var-get total-progressive-released)),
+        release-percentage: (var-get progressive-release-percentage)
+    }))
+
+(define-read-only (get-progressive-threshold (threshold-id uint))
+    (ok (map-get? progressive-thresholds threshold-id)))
+
+(define-read-only (check-threshold-eligibility (threshold-id uint))
+    (let ((threshold (map-get? progressive-thresholds threshold-id))
+          (current-progress (/ (* (var-get total-raised) u100) (var-get campaign-goal))))
+        (if (is-some threshold)
+            (let ((threshold-data (unwrap-panic threshold)))
+                (ok {
+                    eligible: (>= current-progress (get threshold-percentage threshold-data)),
+                    unlocked: (get unlocked threshold-data),
+                    current-progress: current-progress,
+                    required-progress: (get threshold-percentage threshold-data)
+                }))
+            (ok {eligible: false, unlocked: false, current-progress: u0, required-progress: u0}))))
