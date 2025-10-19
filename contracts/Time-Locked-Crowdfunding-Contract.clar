@@ -401,3 +401,246 @@
                     required-progress: (get threshold-percentage threshold-data)
                 }))
             (ok {eligible: false, unlocked: false, current-progress: u0, required-progress: u0}))))
+
+;; ===== CAMPAIGN ANALYTICS & METRICS SYSTEM =====
+
+;; Analytics error constants
+(define-constant ERR-ANALYTICS-DISABLED (err u600))
+(define-constant ERR-INVALID-TIMEFRAME (err u601))
+(define-constant ERR-SNAPSHOT-EXISTS (err u602))
+(define-constant ERR-NO-ANALYTICS-DATA (err u603))
+
+;; Analytics data variables
+(define-data-var analytics-enabled bool true)
+(define-data-var total-contributors uint u0)
+(define-data-var highest-contribution uint u0)
+(define-data-var lowest-contribution uint u1000000000000)
+(define-data-var campaign-creation-block uint u0)
+(define-data-var last-contribution-block uint u0)
+
+;; Contribution tracking maps
+(define-map contribution-history
+    uint ;; block-height
+    {amount: uint, contributor: principal, total-at-block: uint})
+
+(define-map daily-metrics
+    uint ;; day (block-height / 144)
+    {contributions: uint, contributors: uint, total-amount: uint})
+
+(define-map contributor-metrics
+    principal
+    {first-contribution-block: uint, total-contributions: uint, contribution-count: uint})
+
+(define-map campaign-snapshots
+    uint ;; snapshot-id
+    {block-height: uint, total-raised: uint, contributors: uint, progress-percentage: uint, timestamp: uint})
+
+(define-data-var next-snapshot-id uint u1)
+(define-data-var contribution-counter uint u0)
+
+;; Initialize analytics system
+(define-public (initialize-analytics)
+    (begin
+        (asserts! (is-eq tx-sender (var-get campaign-owner)) ERR-UNAUTHORIZED)
+        (var-set campaign-creation-block stacks-block-height)
+        (var-set analytics-enabled true)
+        (ok true)))
+
+;; Record contribution analytics (called internally)
+(define-private (record-contribution-analytics (contributor principal) (amount uint))
+    (let ((current-day (/ stacks-block-height u144))
+          (existing-metrics (default-to {contributions: u0, contributors: u0, total-amount: u0}
+                           (map-get? daily-metrics current-day)))
+          (contributor-data (default-to {first-contribution-block: stacks-block-height, 
+                                       total-contributions: u0, contribution-count: u0}
+                          (map-get? contributor-metrics contributor)))
+          (is-new-contributor (is-none (map-get? contributor-metrics contributor))))
+        (begin
+            ;; Update daily metrics
+            (map-set daily-metrics current-day {
+                contributions: (+ (get contributions existing-metrics) u1),
+                contributors: (+ (get contributors existing-metrics) (if is-new-contributor u1 u0)),
+                total-amount: (+ (get total-amount existing-metrics) amount)
+            })
+            
+            ;; Update contributor metrics
+            (map-set contributor-metrics contributor {
+                first-contribution-block: (get first-contribution-block contributor-data),
+                total-contributions: (+ (get total-contributions contributor-data) amount),
+                contribution-count: (+ (get contribution-count contributor-data) u1)
+            })
+            
+            ;; Record contribution history
+            (map-set contribution-history stacks-block-height {
+                amount: amount,
+                contributor: contributor,
+                total-at-block: (var-get total-raised)
+            })
+            
+            ;; Update global analytics
+            (if is-new-contributor
+                (var-set total-contributors (+ (var-get total-contributors) u1))
+                true)
+            
+            (if (> amount (var-get highest-contribution))
+                (var-set highest-contribution amount)
+                true)
+            
+            (if (< amount (var-get lowest-contribution))
+                (var-set lowest-contribution amount)
+                true)
+            
+            (var-set last-contribution-block stacks-block-height)
+            (var-set contribution-counter (+ (var-get contribution-counter) u1))
+            true)))
+
+;; Create campaign snapshot
+(define-public (create-campaign-snapshot)
+    (let ((snapshot-id (var-get next-snapshot-id))
+          (progress (/ (* (var-get total-raised) u100) (var-get campaign-goal))))
+        (begin
+            (asserts! (var-get analytics-enabled) ERR-ANALYTICS-DISABLED)
+            (map-set campaign-snapshots snapshot-id {
+                block-height: stacks-block-height,
+                total-raised: (var-get total-raised),
+                contributors: (var-get total-contributors),
+                progress-percentage: progress,
+                timestamp: stacks-block-height
+            })
+            (var-set next-snapshot-id (+ snapshot-id u1))
+            (ok snapshot-id))))
+
+;; Enhanced contribute function with analytics
+(define-public (contribute-with-analytics (amount uint))
+    (let ((current-contribution (default-to {amount: u0, claimed: false} 
+            (map-get? contributions tx-sender))))
+        (begin
+            (asserts! (< stacks-block-height (var-get campaign-deadline)) ERR-CAMPAIGN-ENDED)
+            (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+            (asserts! (var-get analytics-enabled) ERR-ANALYTICS-DISABLED)
+            
+            ;; Update contribution mapping
+            (map-set contributions tx-sender 
+                {amount: (+ (get amount current-contribution) amount),
+                 claimed: false})
+            
+            ;; Update total raised
+            (var-set total-raised (+ (var-get total-raised) amount))
+            
+            ;; Record analytics
+            (record-contribution-analytics tx-sender amount)
+            
+            (ok true))))
+
+;; Get comprehensive campaign analytics
+(define-read-only (get-campaign-analytics)
+    (let ((campaign-duration (- stacks-block-height (var-get campaign-creation-block)))
+          (progress-percentage (/ (* (var-get total-raised) u100) (var-get campaign-goal)))
+          (avg-contribution (if (> (var-get total-contributors) u0)
+                              (/ (var-get total-raised) (var-get total-contributors))
+                              u0))
+          (days-remaining (if (> (var-get campaign-deadline) stacks-block-height)
+                            (/ (- (var-get campaign-deadline) stacks-block-height) u144)
+                            u0)))
+        (ok {
+            total-raised: (var-get total-raised),
+            goal: (var-get campaign-goal),
+            progress-percentage: progress-percentage,
+            total-contributors: (var-get total-contributors),
+            total-contributions: (var-get contribution-counter),
+            highest-contribution: (var-get highest-contribution),
+            lowest-contribution: (if (< (var-get lowest-contribution) u1000000000000) 
+                                   (var-get lowest-contribution) u0),
+            average-contribution: avg-contribution,
+            campaign-duration-blocks: campaign-duration,
+            campaign-duration-days: (/ campaign-duration u144),
+            days-remaining: days-remaining,
+            blocks-remaining: (if (> (var-get campaign-deadline) stacks-block-height)
+                               (- (var-get campaign-deadline) stacks-block-height)
+                               u0),
+            last-contribution-block: (var-get last-contribution-block),
+            analytics-enabled: (var-get analytics-enabled)
+        })))
+
+;; Get daily metrics for a specific day
+(define-read-only (get-daily-metrics (day uint))
+    (ok (map-get? daily-metrics day)))
+
+;; Get contributor analytics
+(define-read-only (get-contributor-analytics (contributor principal))
+    (let ((metrics (map-get? contributor-metrics contributor))
+          (contribution (map-get? contributions contributor)))
+        (if (and (is-some metrics) (is-some contribution))
+            (let ((metrics-data (unwrap-panic metrics))
+                  (contribution-data (unwrap-panic contribution)))
+                (ok (some {
+                    first-contribution-block: (get first-contribution-block metrics-data),
+                    total-contributions: (get total-contributions metrics-data),
+                    contribution-count: (get contribution-count metrics-data),
+                    current-amount: (get amount contribution-data),
+                    claimed-refund: (get claimed contribution-data),
+                    participation-duration: (if (> (var-get last-contribution-block) 
+                                                 (get first-contribution-block metrics-data))
+                                              (- (var-get last-contribution-block) 
+                                                 (get first-contribution-block metrics-data))
+                                              u0)
+                })))
+            (ok none))))
+
+;; Get campaign snapshot by ID
+(define-read-only (get-campaign-snapshot (snapshot-id uint))
+    (ok (map-get? campaign-snapshots snapshot-id)))
+
+;; Get contribution history for a specific block
+(define-read-only (get-contribution-history (target-block uint))
+    (ok (map-get? contribution-history target-block)))
+
+;; Get campaign performance metrics
+(define-read-only (get-performance-metrics)
+    (let ((current-day (/ stacks-block-height u144))
+          (campaign-start-day (/ (var-get campaign-creation-block) u144))
+          (campaign-days (if (>= current-day campaign-start-day) 
+                          (- current-day campaign-start-day) u0))
+          (daily-average (if (> campaign-days u0)
+                          (/ (var-get total-raised) campaign-days)
+                          u0))
+          (contributor-engagement (if (> (var-get total-contributors) u0)
+                                   (/ (var-get contribution-counter) (var-get total-contributors))
+                                   u0))
+          (progress-percentage (/ (* (var-get total-raised) u100) (var-get campaign-goal)))
+          (success-calc (+ progress-percentage (/ daily-average u10000)))
+          (success-probability (if (> success-calc u100) u100 success-calc)))
+        (ok {
+            campaign-days: campaign-days,
+            daily-average-raised: daily-average,
+            contributor-engagement-rate: contributor-engagement,
+            funding-velocity: (if (> campaign-days u0)
+                               (/ (* (var-get total-raised) u100) 
+                                  (* (var-get campaign-goal) campaign-days))
+                               u0),
+            success-probability: success-probability,
+            total-snapshots: (- (var-get next-snapshot-id) u1)
+        })))
+
+;; Toggle analytics system
+(define-public (toggle-analytics (enable bool))
+    (begin
+        (asserts! (is-eq tx-sender (var-get campaign-owner)) ERR-UNAUTHORIZED)
+        (var-set analytics-enabled enable)
+        (ok enable)))
+
+;; Get recent activity (last 10 blocks of contributions)
+(define-read-only (get-recent-activity)
+    (let ((recent-blocks (list 
+            (- stacks-block-height u0) (- stacks-block-height u1) (- stacks-block-height u2)
+            (- stacks-block-height u3) (- stacks-block-height u4) (- stacks-block-height u5)
+            (- stacks-block-height u6) (- stacks-block-height u7) (- stacks-block-height u8)
+            (- stacks-block-height u9))))
+        (ok {
+            recent-contributions: (filter is-contribution-block recent-blocks),
+            total-recent-blocks: (len recent-blocks)
+        })))
+
+;; Helper function to check if a block has contributions
+(define-private (is-contribution-block (target-block uint))
+    (is-some (map-get? contribution-history target-block)))
