@@ -644,3 +644,82 @@
 ;; Helper function to check if a block has contributions
 (define-private (is-contribution-block (target-block uint))
     (is-some (map-get? contribution-history target-block)))
+
+;; ===== CAMPAIGN PAUSE/RESUME SYSTEM =====
+
+;; Pause/Resume error constants
+(define-constant ERR-CAMPAIGN-PAUSED (err u700))
+(define-constant ERR-CAMPAIGN-NOT-PAUSED (err u701))
+(define-constant ERR-PAUSE-REASON-INVALID (err u702))
+
+;; Pause/Resume data variables
+(define-data-var campaign-paused bool false)
+(define-data-var pause-block uint u0)
+(define-data-var total-pause-duration uint u0)
+(define-data-var pause-reason (string-ascii 50) "")
+(define-data-var pause-count uint u0)
+
+;; Pause history tracking
+(define-map pause-history
+    uint
+    {pause-block: uint, resume-block: uint, reason: (string-ascii 50), duration: uint})
+
+;; Pause/resume campaign
+(define-public (pause-campaign (reason (string-ascii 50)))
+    (begin
+        (asserts! (is-eq tx-sender (var-get campaign-owner)) ERR-UNAUTHORIZED)
+        (asserts! (not (var-get campaign-paused)) ERR-ALREADY-CLAIMED)
+        (asserts! (> (len reason) u0) ERR-PAUSE-REASON-INVALID)
+        (var-set campaign-paused true)
+        (var-set pause-block stacks-block-height)
+        (var-set pause-reason reason)
+        (ok true)))
+
+(define-public (resume-campaign)
+    (let ((pause-duration (- stacks-block-height (var-get pause-block)))
+          (current-pause-count (var-get pause-count)))
+        (begin
+            (asserts! (is-eq tx-sender (var-get campaign-owner)) ERR-UNAUTHORIZED)
+            (asserts! (var-get campaign-paused) ERR-CAMPAIGN-NOT-PAUSED)
+            (map-set pause-history current-pause-count {
+                pause-block: (var-get pause-block),
+                resume-block: stacks-block-height,
+                reason: (var-get pause-reason),
+                duration: pause-duration
+            })
+            (var-set campaign-paused false)
+            (var-set total-pause-duration (+ (var-get total-pause-duration) pause-duration))
+            (var-set pause-count (+ current-pause-count u1))
+            (var-set campaign-deadline (+ (var-get campaign-deadline) pause-duration))
+            (ok true))))
+
+;; Get pause/resume status
+(define-read-only (get-pause-status)
+    (ok {
+        paused: (var-get campaign-paused),
+        pause-block: (var-get pause-block),
+        total-pause-duration: (var-get total-pause-duration),
+        pause-reason: (var-get pause-reason),
+        pause-count: (var-get pause-count),
+        blocks-paused: (if (var-get campaign-paused)
+                          (- stacks-block-height (var-get pause-block))
+                          u0)
+    }))
+
+;; Get pause history entry
+(define-read-only (get-pause-history (pause-id uint))
+    (ok (map-get? pause-history pause-id)))
+
+;; Block contributions if campaign is paused
+(define-public (contribute-with-pause-check)
+    (let ((current-contribution (default-to {amount: u0, claimed: false} 
+            (map-get? contributions tx-sender))))
+        (begin
+            (asserts! (not (var-get campaign-paused)) ERR-CAMPAIGN-PAUSED)
+            (asserts! (< stacks-block-height (var-get campaign-deadline)) ERR-CAMPAIGN-ENDED)
+            (asserts! (> (stx-get-balance tx-sender) u0) ERR-INVALID-AMOUNT)
+            (map-set contributions tx-sender 
+                {amount: (+ (get amount current-contribution) (stx-get-balance tx-sender)),
+                 claimed: false})
+            (var-set total-raised (+ (var-get total-raised) (stx-get-balance tx-sender)))
+            (ok true))))
